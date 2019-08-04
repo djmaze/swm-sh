@@ -1,0 +1,266 @@
+#!/bin/bash
+set -euo pipefail
+[[ -n "${DEBUG:-}" ]] && set -x
+
+SWARMS_DIR=~/.config/swm/swarms
+
+current_task_for_service() {
+  local service="$1"
+  docker service ps -q "$service" | head -n1
+}
+
+wait_for() {
+  command="$*"
+
+  while [[ "$(eval "$command")" == false ]]; do
+    sleep 5
+  done
+}
+
+check_service_state() {
+  local service="$1"
+  local wanted_state="$2"
+  local rc=0
+  local output
+
+  output="$(docker service ps --format '{{.CurrentState}}' "$service")"
+  echo "$output"  | grep -v "$wanted_state" >/dev/null || rc=$?
+
+  if [[ $rc == 0 ]]; then
+    echo false
+  else
+    echo true
+  fi
+}
+
+follow() {
+  local service="$1"
+
+  >&2 echo "Following service $service"
+
+  if [[ "$(check_service_state "$service" complete)" == false ]]; then
+    docker service logs -f "$service" &
+    pid=$!
+    wait_for check_service_state "$service" Complete
+    kill $pid
+
+    >&2 echo "Task for service $service finished."
+  else
+    >&2 echo Task for service "$service" already finished. Log output:
+    docker service logs "$service"
+  fi
+}
+
+deployment_status() {
+  local stack="$1"
+
+  docker stack ps -f desired-state=running -f desired-state=ready --format "{{ .DesiredState }} {{.CurrentState }}" "$stack" | grep -v "Running Running" >/dev/null && echo "deploying"
+}
+
+wait_for_stack_deploy() {
+  local stack="$1"
+
+  >&2 echo Waiting for deployment of stack "$stack"..
+
+  watch docker stack ps "$stack" &
+  pid=$!
+
+  while [[ "$(deployment_status "$stack")" == "deploying" ]]; do
+    sleep 5
+  done
+
+  kill $pid
+  sleep 1
+  >&2 echo Stack "$stack" deployed.
+}
+
+get_last_output_line() {
+  local service="$1"
+
+  wait_for check_service_state "$service" Complete
+  docker service logs --tail 1 --no-task-ids "$service" | awk -F '@' '{print $2}' | awk -F '|' '{print $1 " " $2}'
+}
+
+cluster_id() {
+  if [[ -n "${SWM_CLUSTER_ID:-}" ]]; then
+    echo "$SWM_CLUSTER_ID"
+  else
+    docker info -f '{{.Swarm.Cluster.ID}}'
+  fi
+}
+
+fetch() {
+  local ssh_host="${1:-}"
+  local cluster_id service docker_host
+
+  docker_host="${DOCKER_HOST:-ssh://$ssh_host}"
+  cluster_id="$(cluster_id)"
+  >&2 echo Updating node list for cluster "${cluster_id}.."
+
+  service="$(env DOCKER_HOST="$docker_host" docker service create --name swm-get-ip --mode global --restart-condition on-failure --detach --quiet alpine sh -c "apk add --no-cache curl jq && curl -s ipinfo.io | jq -r .ip")"
+
+  rm "${SWARMS_DIR:?}/${cluster_id:?}" -fR
+  mkdir -p "$SWARMS_DIR/$cluster_id"
+
+  while IFS= read -r line; do
+    local name ip user
+
+    name="$(echo "$line" | awk '{print $1}')"
+    ip="$(echo "$line" | awk '{print $2}')"
+    user="$(env DOCKER_HOST="$docker_host" docker node inspect -f '{{.Spec.Labels.ssh_user}}' "$name")"
+    [[ "$user" == "<no value>" ]] && user="root"
+
+    echo "$name" >"$SWARMS_DIR/$cluster_id/$name.name"
+    echo "$ip" >"$SWARMS_DIR/$cluster_id/$name.ip"
+    echo "$user" >"$SWARMS_DIR/$cluster_id/$name.user"
+  done < <(get_last_output_line "$service")
+
+  docker service rm "$service" >/dev/null
+  >&2 echo Done.
+}
+
+ip_for_node() {
+  local name="$1"
+  local cluster_id="${2:-}"
+
+  [[ -z "$cluster_id" ]] && cluster_id="$(cluster_id)"
+
+  cat "$SWARMS_DIR/${cluster_id}/$name.ip"
+}
+
+user_for_node() {
+  local name="$1"
+  local cluster_id="${2:-}"
+
+  [[ -z "$cluster_id" ]] && cluster_id="$(cluster_id)"
+
+  cat "$SWARMS_DIR/${cluster_id}/$name.user"
+}
+
+nodes() {
+  local cluster_id
+  cluster_id="$(cluster_id)"
+
+  while IFS= read -r name; do
+    echo -e "$(user_for_node "$name" "$cluster_id")@$name\t$(ip_for_node "$name" "$cluster_id")"
+  done < <(cat "$SWARMS_DIR/$(cluster_id)"/*.name)
+}
+
+docker_host_var_for_node() {
+  local node="$1"
+  local cluster_id="${2:-}"
+  local user ip
+
+  [[ -z "$cluster_id" ]] && cluster_id="$(cluster_id)"
+  user="$(user_for_node "$node" "$cluster_id")"
+  ip="$(ip_for_node "$node" "$cluster_id")"
+
+  echo DOCKER_HOST="ssh://$user@$ip"
+}
+
+swarm_env() {
+  local cluster_id="$1"
+  local node="${2:-}"
+  local ip
+
+  if [[ -n "$node" ]]; then
+    ip="$(ip_for_node "$node" "$cluster_id")"
+  else
+    node="$(cat "$SWARMS_DIR/$cluster_id"/*.name | sort -R | head -n 1)"
+    ip="$(ip_for_node "$node" "$cluster_id")"
+  fi
+
+  >&2 echo Using node "$node" "($ip)"
+  echo export SWM_CLUSTER_ID="$cluster_id"
+  echo export "$(docker_host_var_for_node "$node" "$cluster_id")"
+}
+
+node_and_task_for_service() {
+  local service="$1"
+
+  docker service ps -f desired-state=running --format '{{.Node}} {{.ID}} {{.DesiredState}} {{.CurrentState}}' "${service}" | grep "Running Running" | head -n 1 | awk '{print $1 " " $2}'
+}
+
+container_for_task() {
+  local task="$1"
+
+  docker inspect -f '{{.Status.ContainerStatus.ContainerID}}' "$task"
+}
+
+swarm_exec() {
+  local service="$1"
+  shift
+  local node_and_task
+  local node
+  local task
+  local ip
+
+  node_and_task="$(node_and_task_for_service "$service")"
+  node="$(echo "$node_and_task" | awk '{ print $1}')"
+  task="$(echo "$node_and_task" | awk '{ print $2}')"
+
+  ip="$(ip_for_node "$node")"
+  container="$(container_for_task "$task")"
+
+  >&2 echo Executing \""$@"\" in container "${container}" on "${node}"
+  env "$(docker_host_var_for_node "$node")" docker exec -it "$container" "$@"
+}
+
+main() {
+  local command="${1:-}"
+  [[ -n "$command" ]] && shift
+
+  case $command in
+    follow)
+      follow "$@"
+      ;;
+    wait-for-stack-deploy)
+      wait_for_stack_deploy "$@"
+      ;;
+    get-last-output-line)
+      get_last_output_line "$@"
+      ;;
+    fetch)
+      fetch "$@"
+      ;;
+    nodes)
+      nodes "$@"
+      ;;
+    env)
+      swarm_env "$@"
+      ;;
+    cluster-id)
+      cluster_id
+      ;;
+    exec)
+      swarm_exec "$@"
+      ;;
+    --help)
+      >&2 echo "Synopsis: swm <command> <args>"
+      >&2 echo "Where <command> is one of:"
+      >&2 echo
+      >&2 echo "fetch <user@host>"
+      >&2 echo -e "\tfetch list of swarm nodes from given node"
+      >&2 echo "nodes"
+      >&2 echo -e "\toutput nodes of the current swarm"
+      >&2 echo "env <cluster id>"
+      >&2 echo -e "\tget environment variables for a node in the given cluster"
+      >&2 echo "exec <service> <command..>"
+      >&2 echo -e "\trun a command in a given service"
+      >&2 echo "cluster-id"
+      >&2 echo -e "\tget current cluster id"
+      >&2 echo "follow <service>"
+      >&2 echo -e "\tfollow output of a running service and wait for it to finish"
+      >&2 echo "wait-for-stack-deploy <stack>"
+      >&2 echo -e "\twait for a stack to be deployed successfully"
+      >&2 echo "get-last-output-line <service>"
+      >&2 echo -e "\tget last output line of a service and wait for it to finish"
+      ;;
+    *)
+      >&2 echo "Error: unknown command"
+      >&2 echo "Try --help"
+      exit 1
+  esac
+}
+
+main "$@"
