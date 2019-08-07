@@ -20,10 +20,11 @@ wait_for() {
 check_service_state() {
   local service="$1"
   local wanted_state="$2"
+  local docker_host="${3:-$DOCKER_HOST}"
   local rc=0
   local output
 
-  output="$(docker service ps --format '{{.CurrentState}}' "$service")"
+  output="$(env DOCKER_HOST="$docker_host" docker service ps --format '{{.CurrentState}}' "$service")"
   echo "$output"  | grep -v "$wanted_state" >/dev/null || rc=$?
 
   if [[ $rc == 0 ]]; then
@@ -76,16 +77,19 @@ wait_for_stack_deploy() {
 
 get_last_output_line() {
   local service="$1"
+  local docker_host="${2:-$DOCKER_HOST}"
 
-  wait_for check_service_state "$service" Complete
-  docker service logs --tail 1 --no-task-ids "$service" | awk -F '@' '{print $2}' | awk -F '|' '{print $1 " " $2}'
+  wait_for check_service_state "$service" Complete "$docker_host"
+  env DOCKER_HOST="$docker_host" docker service logs --tail 1 --no-task-ids "$service" | awk -F '@' '{print $2}' | awk -F '|' '{print $1 " " $2}'
 }
 
 cluster_id() {
+  local docker_host="${1:-$DOCKER_HOST}"
+
   if [[ -n "${SWM_CLUSTER_ID:-}" ]]; then
     echo "$SWM_CLUSTER_ID"
   else
-    docker info -f '{{.Swarm.Cluster.ID}}'
+    env DOCKER_HOST="$docker_host" docker info -f '{{.Swarm.Cluster.ID}}'
   fi
 }
 
@@ -94,7 +98,7 @@ fetch() {
   local cluster_id service docker_host
 
   docker_host="${DOCKER_HOST:-ssh://$ssh_host}"
-  cluster_id="$(cluster_id)"
+  cluster_id="$(cluster_id "$docker_host")"
   >&2 echo Updating node list for cluster "${cluster_id}.."
 
   service="$(env DOCKER_HOST="$docker_host" docker service create --name swm-get-ip --mode global --restart-condition on-failure --detach --quiet alpine sh -c "apk add --no-cache curl jq && curl -s ipinfo.io | jq -r .ip")"
@@ -113,9 +117,9 @@ fetch() {
     echo "$name" >"$SWARMS_DIR/$cluster_id/$name.name"
     echo "$ip" >"$SWARMS_DIR/$cluster_id/$name.ip"
     echo "$user" >"$SWARMS_DIR/$cluster_id/$name.user"
-  done < <(get_last_output_line "$service")
+  done < <(get_last_output_line "$service" "$docker_host")
 
-  docker service rm "$service" >/dev/null
+  env DOCKER_HOST="$docker_host" docker service rm "$service" >/dev/null
   >&2 echo Done.
 }
 
