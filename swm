@@ -210,6 +210,17 @@ swarm_exec() {
   env "$(docker_host_var_for_node "$node")" docker exec -it "$container" "$@"
 }
 
+swarm_each() {
+  local command=$*
+  local cluster_id
+  cluster_id="$(cluster_id)"
+
+  while IFS= read -r name; do
+    echo "[$name]"
+    ssh "$(user_for_node "$name" "$cluster_id")@$(ip_for_node "$name" "$cluster_id")" -- $command </dev/null
+  done < <(cat "$SWARMS_DIR/$(cluster_id)"/*.name)
+}
+
 main() {
   local command="${1:-}"
   [[ -n "$command" ]] && shift
@@ -239,6 +250,9 @@ main() {
     exec)
       swarm_exec "$@"
       ;;
+    each)
+      swarm_each "$@"
+      ;;
     --help)
       >&2 echo "Synopsis: swm <command> <args>"
       >&2 echo "Where <command> is one of:"
@@ -259,6 +273,8 @@ main() {
       >&2 echo -e "\twait for a stack to be deployed successfully"
       >&2 echo "get-last-output-line <service>"
       >&2 echo -e "\tget last output line of a service and wait for it to finish"
+      >&2 echo "each <command>"
+      >&2 echo -e "\trun the given <command> on each node"
       ;;
     *)
       >&2 echo "Error: unknown command"
