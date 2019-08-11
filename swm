@@ -277,8 +277,8 @@ main() {
       >&2 echo -e "\trun the given <command> on each node"
       ;;
     *)
-      >&2 echo "Error: unknown command"
-      >&2 echo "Try --help"
+      >&2 echo "swm: '$command' is not a swm command."
+      >&2 echo "See 'swm --help'"
       exit 1
   esac
 }
