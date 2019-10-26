@@ -191,20 +191,29 @@ container_for_task() {
   docker inspect -f '{{.Status.ContainerStatus.ContainerID}}' "$task"
 }
 
-swarm_exec() {
+node_and_container_for_service() {
   local service="$1"
-  shift
   local node_and_task
   local node
   local task
-  local ip
 
   node_and_task="$(node_and_task_for_service "$service")"
   node="$(echo "$node_and_task" | awk '{ print $1}')"
   task="$(echo "$node_and_task" | awk '{ print $2}')"
 
-  ip="$(ip_for_node "$node")"
   container="$(container_for_task "$task")"
+
+  echo "$node $container"
+}
+
+swarm_exec() {
+  local service="$1"
+  shift
+  local node_and_container node container
+
+  node_and_container="$(node_and_container_for_service "$service")"
+  node="$(echo "$node_and_container" | awk '{ print $1}')"
+  container="$(echo "$node_and_container" | awk '{ print $2}')"
 
   >&2 echo Executing \""$@"\" in container "${container}" on "${node}"
   env "$(docker_host_var_for_node "$node")" docker exec -it "$container" "$@"
@@ -219,6 +228,18 @@ swarm_each() {
     echo "[$name]"
     ssh "$(user_for_node "$name" "$cluster_id")@$(ip_for_node "$name" "$cluster_id")" -- $command </dev/null
   done < <(cat "$SWARMS_DIR/$(cluster_id)"/*.name)
+}
+
+swarm_restart() {
+  local service="$1"
+  local node_and_container node container
+
+  node_and_container="$(node_and_container_for_service "$service")"
+  node="$(echo "$node_and_container" | awk '{ print $1}')"
+  container="$(echo "$node_and_container" | awk '{ print $2}')"
+
+  >&2 echo Stopping container "${container}" on "${node}"
+  env "$(docker_host_var_for_node "$node")" docker stop "$container"
 }
 
 main() {
@@ -253,6 +274,9 @@ main() {
     each)
       swarm_each "$@"
       ;;
+    restart)
+      swarm_restart "$@"
+      ;;
     --help)
       >&2 echo "Synopsis: swm <command> <args>"
       >&2 echo "Where <command> is one of:"
@@ -275,6 +299,8 @@ main() {
       >&2 echo -e "\tget last output line of a service and wait for it to finish"
       >&2 echo "each <command>"
       >&2 echo -e "\trun the given <command> on each node"
+      >&2 echo "restart <service>"
+      >&2 echo -e "\tstop one container for the service <service>"
       ;;
     *)
       >&2 echo "swm: '$command' is not a swm command."
