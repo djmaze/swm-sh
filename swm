@@ -107,15 +107,18 @@ fetch() {
   mkdir -p "$SWARMS_DIR/$cluster_id"
 
   while IFS= read -r line; do
-    local name ip user
+    local name ip role_and_user role user
 
     name="$(echo "$line" | awk '{print $1}')"
     ip="$(echo "$line" | awk '{print $2}')"
-    user="$(env DOCKER_HOST="$docker_host" docker node inspect -f '{{.Spec.Labels.ssh_user}}' "$name")"
+    role_and_user="$(env DOCKER_HOST="$docker_host" docker node inspect -f '{{.Spec.Role}}|{{.Spec.Labels.ssh_user}}' "$name")"
+    role="$(echo "$role_and_user" | awk -F'|' '{print $1}')"
+    user="$(echo "$role_and_user" | awk -F'|' '{print $2}')"
     [[ "$user" == "<no value>" ]] && user="root"
 
     echo "$name" >"$SWARMS_DIR/$cluster_id/$name.name"
     echo "$ip" >"$SWARMS_DIR/$cluster_id/$name.ip"
+    echo "$role" >"$SWARMS_DIR/$cluster_id/$name.role"
     echo "$user" >"$SWARMS_DIR/$cluster_id/$name.user"
   done < <(get_last_output_line "$service" "$docker_host")
 
@@ -141,12 +144,21 @@ user_for_node() {
   cat "$SWARMS_DIR/${cluster_id}/$name.user"
 }
 
+role_for_node() {
+  local name="$1"
+  local cluster_id="${2:-}"
+
+  [[ -z "$cluster_id" ]] && cluster_id="$(cluster_id)"
+
+  cat "$SWARMS_DIR/${cluster_id}/$name.role"
+}
+
 nodes() {
   local cluster_id
   cluster_id="$(cluster_id)"
 
   while IFS= read -r name; do
-    echo -e "$(user_for_node "$name" "$cluster_id")@$name\t$(ip_for_node "$name" "$cluster_id")"
+    echo -e "$(user_for_node "$name" "$cluster_id")@$name\t$(ip_for_node "$name" "$cluster_id")\t$(role_for_node "$name" "$cluster_id")"
   done < <(cat "$SWARMS_DIR/$(cluster_id)"/*.name)
 }
 
@@ -165,12 +177,23 @@ docker_host_var_for_node() {
 swarm_env() {
   local cluster_id="$1"
   local node="${2:-}"
-  local ip
+  local ip role files
+
+  files="$(ls $SWARMS_DIR/$cluster_id/*.role 2>/dev/null | wc -l || true)"
+  if [[ "$files" == "0"  ]]; then
+    >&2 echo No role information found. Make sure to run \"swm fetch\" after upgrading this script!
+    exit 1
+  fi
 
   if [[ -n "$node" ]]; then
     ip="$(ip_for_node "$node" "$cluster_id")"
   else
-    node="$(cat "$SWARMS_DIR/$cluster_id"/*.name | sort -R | head -n 1)"
+    # return random manager node
+    role=""
+    until [[ "$role" == "manager" ]]; do
+      node="$(cat "$SWARMS_DIR/$cluster_id"/*.name | sort -R | head -n 1)"
+      role="$(cat "$SWARMS_DIR/$cluster_id/${node}.role" || echo "")"
+    done
     ip="$(ip_for_node "$node" "$cluster_id")"
   fi
 
